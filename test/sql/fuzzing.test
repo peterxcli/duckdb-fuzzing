@@ -1,0 +1,101 @@
+# name: test/sql/fuzzing.test
+# description: smoke tests for the fuzzing extension's SQL surface
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT fuzzing_version();
+----
+Catalog Error: Scalar Function with name fuzzing_version does not exist!
+
+require fuzzing
+
+query I
+SELECT length(fuzzing_version()) > 0;
+----
+true
+
+# Every property is registered and discoverable without running anything.
+query I
+SELECT count(*) > 0 FROM fuzzing_properties();
+----
+true
+
+query I
+SELECT count(DISTINCT suite) >= 7 FROM fuzzing_properties();
+----
+true
+
+# Registered suites are the ones the runner and the docs refer to.
+query I
+SELECT list_sort(list(DISTINCT suite)) FROM fuzzing_properties();
+----
+[arithmetic, datetime, known, lists, roundtrip, storage, strings]
+
+# Probes for open upstream issues are declared as expected failures and always
+# carry the issue they track.
+query I
+SELECT count(*) = 0 FROM fuzzing_properties()
+WHERE expectation = 'known_fail' AND (issue IS NULL OR issue NOT LIKE 'duckdb/duckdb#%');
+----
+true
+
+# A tiny run must produce one row per property in the suite, and must not
+# report an unexpected status.
+query I
+SELECT count(*) = (SELECT count(*) FROM fuzzing_properties() WHERE suite = 'lists')
+FROM fuzzing_check('lists', max_success => 1);
+----
+true
+
+query I
+SELECT bool_and(status IN ('pass', 'fail', 'known_fail', 'fixed', 'gave_up', 'skipped'))
+FROM fuzzing_check('lists', max_success => 1);
+----
+true
+
+# The reported seed reproduces the run, so a failure can always be replayed.
+query I
+SELECT count(DISTINCT reproduce) = 1 FROM fuzzing_check('lists', max_success => 1, seed => 42);
+----
+true
+
+# A regression probe for a bug already fixed upstream must pass.
+#
+# Note this runs one probe by name rather than the whole `known` suite: probes
+# registered with FUZZING_KNOWN_FAIL reproduce bugs that are still open, and on
+# a sanitized build (-fno-sanitize-recover=all) some of them abort the process
+# outright - duckdb/duckdb#25107 trips signed overflow in date_t arithmetic.
+# The nightly runner copes by giving every property its own process; a logic
+# test cannot, so it must not run them.
+query II
+SELECT status, issue FROM fuzzing_check('known', property => 'TIMETZ preserves an offset-seconds field');
+----
+pass	duckdb/duckdb#24987
+
+statement error
+SELECT * FROM fuzzing_check('no_such_suite');
+----
+no properties match suite
+
+statement error
+SELECT * FROM fuzzing_check(max_success => 0);
+----
+max_success must be greater than zero
+
+statement error
+SELECT * FROM fuzzing_check(nonsense => 1);
+----
+Invalid named parameter "nonsense"
+
+# A property can be selected by name, which is how the nightly runner isolates
+# each property in its own process.
+query I
+SELECT count(*) = 1 FROM fuzzing_check('lists', property => 'list slicing matches the substring model', max_success => 1);
+----
+true
+
+statement error
+SELECT * FROM fuzzing_check('lists', property => 'nope');
+----
+no property named 'nope' in suite 'lists'

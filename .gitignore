@@ -6,3 +6,13 @@ duckdb_unittest_tempdir/
 testext
 test/python/__pycache__/
 .Rhistory
+
+# Editor / tooling caches
+.cache/
+.zed/
+compile_commands.json
+
+# Nightly property run output
+results/
+report.md
+__pycache__/

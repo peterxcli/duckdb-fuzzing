@@ -1,0 +1,137 @@
+#
+# Builds DuckDB from upstream main with assertions + ASan/UBSan, runs the
+# property suites through the fuzzing extension, and opens one issue per new
+# finding.
+#
+name: Nightly Property Run
+
+on:
+  schedule:
+    # 03:17 UTC daily - offset from the hour so it does not pile up with the
+    # rest of the world's nightly jobs.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duckdb_ref:
+        description: 'DuckDB ref to test (branch, tag or SHA)'
+        default: 'main'
+        type: string
+      max_success:
+        description: 'Generated cases per property'
+        default: '200'
+        type: string
+      file_issues:
+        description: 'Open a GitHub issue per new finding'
+        default: true
+        type: boolean
+
+concurrency:
+  group: nightly-property-run
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  property-run:
+    name: Property run against duckdb/${{ inputs.duckdb_ref || 'main' }}
+    runs-on: ubuntu-latest
+    # A cold build of DuckDB plus the suites needs well over the default hour.
+    timeout-minutes: 300
+    env:
+      DUCKDB_REF: ${{ inputs.duckdb_ref || 'main' }}
+      MAX_SUCCESS: ${{ inputs.max_success || '200' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Sync DuckDB submodule to upstream
+        id: sync
+        run: |
+          git -C duckdb fetch --depth=1 origin "$DUCKDB_REF"
+          git -C duckdb checkout --detach FETCH_HEAD
+          sha=$(git -C duckdb rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Testing duckdb/duckdb@$sha"
+          git -C duckdb log -1 --format='%H %ci %s'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          # The DuckDB SHA is in the key so a fresh upstream commit still starts
+          # from the previous night's cache instead of from nothing.
+          key: nightly-ccache-${{ steps.sync.outputs.sha }}
+          restore-keys: |
+            nightly-ccache-
+
+      - name: Configure
+        run: |
+          cmake -G Ninja \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DFORCE_ASSERT=1 -DENABLE_SANITIZER=1 -DENABLE_UBSAN=1 \
+            -DBUILD_UNITTESTS=0 -DBUILD_SHELL=1 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -S duckdb -B build/relassert
+
+      - name: Build
+        # DuckDB's unity-build translation units compiled at -O3 with ASan and
+        # UBSan need several GB each; the default job count OOM-kills cc1plus on
+        # a 16 GB runner.
+        run: cmake --build build/relassert --parallel 2
+
+      - name: Run property suites
+        id: run
+        continue-on-error: true
+        run: scripts/run_properties.sh build/relassert/duckdb results "$MAX_SUCCESS"
+
+      - name: Triage findings
+        id: triage
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # On a scheduled run `inputs.file_issues` is null, and GitHub's loose
+          # equality makes `null == false` true - so the decision is made here,
+          # where "not a manual run" plainly means "file issues".
+          FILE_ISSUES: ${{ github.event_name != 'workflow_dispatch' || inputs.file_issues }}
+        run: |
+          args=()
+          if [ "$FILE_ISSUES" = "true" ]; then
+            args+=(--file-issues)
+          fi
+          scripts/triage.py \
+            --results results \
+            --duckdb-sha "${{ steps.sync.outputs.sha }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --summary report.md \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "${args[@]}"
+
+      - name: Publish report
+        if: always()
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY" || echo 'No report produced.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: property-results-${{ steps.sync.outputs.sha }}
+          path: |
+            results/
+            report.md
+          retention-days: 30
+
+      - name: Fail the run when a new finding was reported
+        if: steps.triage.outcome == 'failure'
+        run: |
+          echo "New property failures were found; see the report above." >&2
+          exit 1

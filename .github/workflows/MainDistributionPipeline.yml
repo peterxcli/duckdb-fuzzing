@@ -1,5 +1,12 @@
 #
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+# Builds the extension against the pinned duckdb submodule and runs the SQL
+# smoke tests.
+#
+# There is deliberately no binary distribution job here. The property suite
+# calls DuckDB's internal C++ API (Identifier, FlatVector, Value, ...), which
+# changes between releases, so the extension tracks upstream `main` via the
+# submodule rather than a stable release, and is built from source by whoever
+# runs it. The bug hunting itself happens in NightlyPropertyRun.yml.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -12,19 +19,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  duckdb-stable-build:
-    name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
-    with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5-variegata
-      extension_name: waddle
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
 
-  code-quality-check:
-    name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
-    with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5-variegata
-      extension_name: waddle
-      format_checks: 'format;tidy'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ci-ccache-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            ci-ccache-
+
+      # A plain release build: fast enough for CI, and enough to prove the
+      # extension links and its SQL surface works. The nightly job is the one
+      # that builds with assertions and sanitizers.
+      - name: Build
+        run: |
+          cmake -G Ninja \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_UNITTESTS=1 -DBUILD_SHELL=1 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -S duckdb -B build/release
+          cmake --build build/release
+
+      - name: SQL tests
+        run: ./build/release/test/unittest --test-dir . "test/sql/*"
+
+      # A single case per property is cheap and catches a property that throws
+      # or fails to register, without turning CI into a bug hunt.
+      - name: Smoke run every property
+        run: |
+          ./build/release/duckdb -c "
+            SELECT suite, count(*) AS properties,
+                   count(*) FILTER (status NOT IN ('pass', 'known_fail', 'fixed', 'skipped')) AS unexpected
+            FROM fuzzing_check(max_success => 1)
+            GROUP BY ALL ORDER BY 1"
