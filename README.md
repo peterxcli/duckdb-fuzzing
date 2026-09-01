@@ -13,8 +13,7 @@ survive `CAST(v AS VARCHAR)` and back", "`LIKE` must agree with a 40-line refere
 arithmetic must error exactly when the `__int128` result is out of range" — and RapidCheck runs it against
 hundreds of generated inputs, shrinking any failure to a minimal counterexample.
 
-Ported from [peterxcli/duckdb#4](https://github.com/peterxcli/duckdb/pull/4), which ran the same properties
-as a standalone Catch2 binary. The suite has found 12 bugs so far; see [docs/FINDINGS.md](docs/FINDINGS.md).
+The suite has found 12 bugs so far; see [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## SQL interface
 
